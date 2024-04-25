@@ -1,52 +1,52 @@
 package service
 
 import (
+	"DiTing-Go/dal"
 	"DiTing-Go/dal/model"
+	"DiTing-Go/domain/dto"
 	domainEnum "DiTing-Go/domain/enum"
 	"DiTing-Go/domain/vo/req"
+	domainResp "DiTing-Go/domain/vo/resp"
 	"DiTing-Go/global"
+	"DiTing-Go/pkg/cursor"
 	"DiTing-Go/pkg/enum"
 	"DiTing-Go/pkg/resp"
 	"DiTing-Go/pkg/utils"
+	"DiTing-Go/utils/jsonUtils"
 	"DiTing-Go/utils/redisCache"
 	"context"
-	"encoding/json"
 	"fmt"
-	"github.com/apache/rocketmq-client-go/v2/primitive"
-	"github.com/go-redsync/redsync/v4"
+	"github.com/jinzhu/copier"
 	"github.com/pkg/errors"
+	"gorm.io/gen"
 	"gorm.io/gorm"
 	"sort"
 	"strconv"
 )
 
 // ApplyFriendService 添加好友
-// TODO：考虑软删除条件
 func ApplyFriendService(uid int64, applyReq req.UserApplyReq) (resp.ResponseData, error) {
 	ctx := context.Background()
 	friendUid := applyReq.Uid
 	user := global.Query.User
 	userQ := user.WithContext(ctx)
 
-	mutex := global.RedSync.NewMutex(domainEnum.UserLock + strconv.FormatInt(uid, 10))
-	if err := mutex.LockContext(ctx); err != nil {
-		global.Logger.Errorf("加锁失败 %s", err)
-		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	uids := utils.Int64Slice{uid, friendUid}
+	sort.Sort(uids)
+	key := fmt.Sprintf(domainEnum.UserAndFriendLock, uids[0], uids[1])
+	mutex, err := utils.GetLock(key)
+	if err != nil {
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), err
 	}
-	defer func(mutex *redsync.Mutex) {
-		_, err := mutex.Unlock()
-		if err != nil {
-			global.Logger.Errorf("解锁失败 %s", err)
-		}
-	}(mutex)
+	defer utils.ReleaseLock(mutex)
 
 	//检查用户是否存在
 	fun := func() (interface{}, error) {
 		return userQ.Where(user.ID.Eq(friendUid)).First()
 	}
 	userR := model.User{}
-	key := fmt.Sprintf(domainEnum.UserCacheByID, applyReq.Uid)
-	err := utils.GetData(key, &userR, fun)
+	key = fmt.Sprintf(domainEnum.UserCacheByID, applyReq.Uid)
+	err = utils.GetData(key, &userR, fun)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return resp.ErrorResponseData("用户不存在"), errors.New("Business Error")
@@ -117,14 +117,28 @@ func ApplyFriendService(uid int64, applyReq req.UserApplyReq) (resp.ResponseData
 		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
 	}
 	// 发送好友申请事件
-	global.Bus.Publish(domainEnum.FriendApplyEvent, model.UserApply{
+	err = jsonUtils.SendMsgSync(domainEnum.FriendApplyTopic, model.UserApply{
 		UID:        uid,
 		TargetID:   friendUid,
 		Msg:        applyReq.Msg,
 		Status:     enum.NO,
 		ReadStatus: enum.NO,
 	})
+	if err != nil {
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+	//time.Sleep(30 * time.Second)
 	return resp.SuccessResponseData(nil), nil
+}
+
+// IsFriendService 判断是否是好友
+func IsFriendService(uid, friendUid int64) (resp.ResponseData, error) {
+	isFriend, err := IsFriend(uid, friendUid)
+	if err != nil {
+		global.Logger.Errorf("判断好友关系失败 %s", err)
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+	return resp.SuccessResponseData(isFriend), nil
 }
 
 // IsFriend 判断是否是好友
@@ -153,20 +167,16 @@ func IsFriend(uid, friendUid int64) (bool, error) {
 
 func AgreeFriendService(uid, friendUid int64) (resp.ResponseData, error) {
 
-	ctx := context.Background()
-	mutex := global.RedSync.NewMutex(domainEnum.UserLock + strconv.FormatInt(uid, 10))
-	if err := mutex.LockContext(ctx); err != nil {
-		global.Logger.Errorf("加锁失败 %s", err)
-		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	uids := utils.Int64Slice{uid, friendUid}
+	sort.Sort(uids)
+	key := fmt.Sprintf(domainEnum.UserAndFriendLock, uids[0], uids[1])
+	mutex, err := utils.GetLock(key)
+	if err != nil {
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), err
 	}
-	defer func(mutex *redsync.Mutex) {
-		_, err := mutex.Unlock()
-		if err != nil {
-			global.Logger.Errorf("解锁失败 %s", err)
-		}
-	}(mutex)
+	defer utils.ReleaseLock(mutex)
 
-	err := AgreeFriend(uid, friendUid)
+	err = AgreeFriend(uid, friendUid)
 	if err != nil {
 		global.Logger.Errorf("同意好友请求失败 %s", err)
 		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
@@ -263,38 +273,34 @@ func AgreeFriend(uid, friendUid int64) error {
 	}
 
 	// 发送新好友事件
-	userFriendMsg, err := json.Marshal(*userFriends[0])
+	err = jsonUtils.SendMsgSync(domainEnum.NewFriendTopic, userFriends[0])
 	if err != nil {
-		global.Logger.Errorf("json序列化失败 %v", err)
-	}
-	msg := &primitive.Message{
-		Topic: domainEnum.NewFriendTopic,
-		Body:  userFriendMsg,
-	}
-	_, err = global.RocketProducer.SendSync(ctx, msg)
-	if err != nil {
-		global.Logger.Errorf("发送新好友事件失败 %s", err)
+		if err := tx.Rollback(); err != nil {
+			global.Logger.Errorf("事务回滚失败 %s", err.Error())
+		}
+		global.Logger.Errorf("发送新好友事件失败 %s", err.Error())
+		return err
 	}
 	return nil
 }
 
 // DeleteFriendService 删除好友
+// 只删除好友关系和会话,其他耗时操作异步处理
 func DeleteFriendService(uid int64, deleteFriendReq req.DeleteFriendReq) (resp.ResponseData, error) {
 	ctx := context.Background()
 
-	mutex := global.RedSync.NewMutex(domainEnum.UserLock + strconv.FormatInt(uid, 10))
-	if err := mutex.LockContext(ctx); err != nil {
-		global.Logger.Errorf("加锁失败 %s", err)
-		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
-	}
-	defer func(mutex *redsync.Mutex) {
-		_, err := mutex.Unlock()
-		if err != nil {
-			global.Logger.Errorf("解锁失败 %s", err)
-		}
-	}(mutex)
-
 	deleteFriendUid := deleteFriendReq.Uid
+
+	uids := utils.Int64Slice{uid, deleteFriendUid}
+	sort.Sort(uids)
+	key := fmt.Sprintf(domainEnum.UserAndFriendLock, uids[0], uids[1])
+	mutex, err := utils.GetLock(key)
+	if err != nil {
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), err
+	}
+	defer utils.ReleaseLock(mutex)
+
+	// 判断是否为好友
 	isFriend, err := IsFriend(uid, deleteFriendUid)
 	if err != nil {
 		global.Logger.Errorf("查询好友关系失败 %s", err)
@@ -303,13 +309,12 @@ func DeleteFriendService(uid int64, deleteFriendReq req.DeleteFriendReq) (resp.R
 	if !isFriend {
 		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
 	}
+
 	tx := global.Query.Begin()
-	userFriend := global.Query.UserFriend
-	userFriendTx := tx.UserFriend.WithContext(ctx)
-	userApply := global.Query.UserApply
-	userApplyTx := tx.UserApply.WithContext(ctx)
 	// 事务
 	// 软删除好友关系
+	userFriend := global.Query.UserFriend
+	userFriendTx := tx.UserFriend.WithContext(ctx)
 	if _, err := userFriendTx.Where(userFriend.UID.Eq(uid), userFriend.FriendUID.Eq(deleteFriendUid)).Update(userFriend.DeleteStatus, enum.DELETED); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
@@ -330,39 +335,17 @@ func DeleteFriendService(uid int64, deleteFriendReq req.DeleteFriendReq) (resp.R
 	// 删除redis缓存
 	defer redisCache.RemoveUserFriend(deleteFriendUid, uid)
 
-	// 删除好友申请
-	if _, err := userApplyTx.Where(userApply.UID.Eq(uid), userApply.TargetID.Eq(deleteFriendUid)).Delete(); err != nil {
-		if err := tx.Rollback(); err != nil {
-			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-		}
-		global.Logger.Errorf("删除好友失败 %s", err.Error())
-		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
-	}
-	// 删除redis缓存
-	defer redisCache.RemoveUserApply(uid, deleteFriendUid)
-
-	if _, err := userApplyTx.Where(userApply.UID.Eq(deleteFriendUid), userApply.TargetID.Eq(uid)).Delete(); err != nil {
-		if err := tx.Rollback(); err != nil {
-			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-		}
-		global.Logger.Errorf("删除好友失败 %s", err.Error())
-		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
-	}
-	// 删除redis缓存
-	defer redisCache.RemoveUserApply(deleteFriendUid, uid)
-
-	// 软删除好友房间
+	// 删除会话
 	roomFriend := global.Query.RoomFriend
 	roomFriendTx := tx.RoomFriend.WithContext(ctx)
-	uids := utils.Int64Slice{uid, deleteFriendUid}
+	uids = utils.Int64Slice{uid, deleteFriendUid}
 	sort.Sort(uids)
 	fun := func() (interface{}, error) {
 		return roomFriendTx.Where(roomFriend.Uid1.Eq(uids[0]), roomFriend.Uid2.Eq(uids[1])).First()
 	}
 	roomFriendR := model.RoomFriend{}
-	key := fmt.Sprintf(domainEnum.RoomFriendCacheByUidAndFriendUid, uids[0], uids[1])
-	err = utils.GetData(key, &roomFriendR, fun)
-	if err != nil {
+	key = fmt.Sprintf(domainEnum.RoomFriendCacheByUidAndFriendUid, uids[0], uids[1])
+	if err := utils.GetData(key, &roomFriendR, fun); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
 		}
@@ -370,55 +353,38 @@ func DeleteFriendService(uid int64, deleteFriendReq req.DeleteFriendReq) (resp.R
 		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
 	}
 
-	if _, err := roomFriendTx.Where(roomFriend.ID.Eq(roomFriendR.ID)).Update(roomFriend.DeleteStatus, enum.DELETED); err != nil {
-		if err := tx.Rollback(); err != nil {
-			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-		}
-		global.Logger.Errorf("删除好友房间失败 %s", err.Error())
-		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
-	}
-	// 删除redis缓存
-	defer redisCache.RemoveRoomFriend(roomFriendR)
-
-	// 软删除房间表
-	room := global.Query.Room
-	roomTx := tx.Room.WithContext(ctx)
-	if _, err := roomTx.Where(room.ID.Eq(roomFriendR.RoomID)).Update(room.DeleteStatus, enum.DELETED); err != nil {
-		if err := tx.Rollback(); err != nil {
-			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-		}
-		global.Logger.Errorf("删除房间失败 %s", err.Error())
-		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
-	}
-	// 删除redis缓存
-	roomR := model.Room{
-		ID: roomFriendR.RoomID,
-	}
-	defer redisCache.RemoveRoomCache(roomR)
-
-	// 删除消息表
-	msg := global.Query.Message
-	msgTx := tx.Message.WithContext(ctx)
-	if _, err := msgTx.Where(msg.RoomID.Eq(roomFriendR.RoomID)).Update(msg.DeleteStatus, enum.DELETED); err != nil {
-		if err := tx.Rollback(); err != nil {
-			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-		}
-		global.Logger.Errorf("删除消息失败 %s", err.Error())
-		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
-	}
-	// TODO: 删除消息表缓存
-
-	// 删除会话
 	contact := global.Query.Contact
 	contactTx := tx.Contact.WithContext(ctx)
-	if _, err := contactTx.Where(contact.RoomID.Eq(roomFriendR.RoomID)).Delete(); err != nil {
+	resultInfo, err := contactTx.Where(contact.RoomID.Eq(roomFriendR.RoomID)).Delete()
+	if err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
 		}
 		global.Logger.Errorf("删除会话失败 %s", err.Error())
 		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
 	}
+	if resultInfo.RowsAffected == 0 {
+		if err := tx.Rollback(); err != nil {
+			global.Logger.Errorf("事务回滚失败 %s", err.Error())
+		}
+		global.Logger.Errorf("会话不存在 %d", roomFriendR.RoomID)
+		return resp.ErrorResponseData("删除好友失败"), errors.New("Business Error")
+	}
 	// TODO:删除缓存
+
+	// 发送消息
+	DeleteFriendDto := dto.DeleteFriendDto{
+		Uid:       uid,
+		FriendUid: deleteFriendUid,
+	}
+	err = jsonUtils.SendMsgSync(domainEnum.DeleteFriendTopic, DeleteFriendDto)
+	if err != nil {
+		if err := tx.Rollback(); err != nil {
+			global.Logger.Errorf("事务回滚失败 %s", err.Error())
+		}
+		global.Logger.Errorf("发送删除好友事件失败 %s", err.Error())
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
 
 	if err := tx.Commit(); err != nil {
 		global.Logger.Errorf("事务提交失败 %s", err.Error())
@@ -426,4 +392,74 @@ func DeleteFriendService(uid int64, deleteFriendReq req.DeleteFriendReq) (resp.R
 	}
 
 	return resp.SuccessResponseData(nil), nil
+}
+
+// GetUserApplyService 获取好友申请列表
+func GetUserApplyService(uid int64, pageReq cursor.PageReq) (resp.ResponseData, error) {
+	ctx := context.Background()
+	// 获取 UserApply 表中 TargetID 等于 uid(登录用户ID)的用户ID集合，采用游标分页
+	db := dal.DB
+	userApplys := make([]model.UserApply, 0)
+	condition := []interface{}{"target_id=?", strconv.FormatInt(uid, 10)}
+	pageResp, err := cursor.Paginate(db, pageReq, &userApplys, "create_time", false, condition...)
+	if err != nil {
+		global.Logger.Errorf("查询好友申请表失败 %s", err)
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+
+	uids := make([]int64, 0)
+	n := len(userApplys)
+	for i := 0; i < n; i++ {
+		uids = append(uids, userApplys[i].UID)
+	}
+
+	user := global.Query.User
+	// 根据 uids 集合查询 User 表
+	users, err := user.WithContext(ctx).Select(user.ID, user.Name, user.Avatar).Where(user.ID.In(uids...)).Find()
+	if err != nil {
+		global.Logger.Errorf("查询用户表失败 %s", err)
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+
+	if len(users) != len(userApplys) {
+		global.Logger.Errorf("用户表和好友申请表数据不匹配")
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+	var usersVO = make([]domainResp.UserApplyResp, 0)
+	// 数据转换
+	for i := 0; i < len(users); i++ {
+		var userVO domainResp.UserApplyResp
+		_ = copier.Copy(&userVO, &users[i])
+		userVO.Msg = userApplys[i].Msg
+		userVO.Status = userApplys[i].Status
+		usersVO = append(usersVO, userVO)
+	}
+	pageResp.Data = usersVO
+
+	userApply := global.Query.UserApply
+	userApplyQ := global.Query.UserApply.WithContext(ctx)
+	// 更新已读状态
+	_, err = userApplyQ.Where(userApply.TargetID.Eq(uid), userApply.ReadStatus.Eq(enum.NO)).Update(userApply.ReadStatus, enum.YES)
+	if err != nil {
+		global.Logger.Errorf("更新好友申请表失败 %s", err)
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+
+	return resp.SuccessResponseData(pageResp), nil
+}
+
+func UnreadApplyNumService(uid int64) (resp.ResponseData, error) {
+	ctx := context.Background()
+	userApply := global.Query.UserApply
+	userApplyQ := userApply.WithContext(ctx)
+
+	// TODO 直接count
+	// 获取 UserApply 表中 TargetID 等于 uid(登录用户ID)的用户ID集合
+	subQuery := userApplyQ.Where(userApply.TargetID.Eq(uid), userApply.ReadStatus.Eq(enum.NO)).Limit(99)
+	num, err := gen.Table(subQuery.As("t")).Count()
+	if err != nil {
+		global.Logger.Errorf("查询好友申请表失败 %s", err)
+		return resp.ErrorResponseData("系统正忙，请稍后再试"), errors.New("Business Error")
+	}
+	return resp.SuccessResponseData(num), nil
 }

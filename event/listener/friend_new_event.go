@@ -13,7 +13,6 @@ import (
 	"github.com/apache/rocketmq-client-go/v2"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
-	"github.com/go-redsync/redsync/v4"
 	"github.com/goccy/go-json"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -65,16 +64,16 @@ func friendNewEvent(ctx context.Context, ext ...*primitive.MessageExt) (consumer
 func friendNew(userFriend model.UserFriend) error {
 	ctx := context.Background()
 
-	mutex := global.RedSync.NewMutex(enum.UserLock + strconv.FormatInt(userFriend.UID, 10))
-	if err := mutex.LockContext(ctx); err != nil {
-		global.Logger.Errorf("加锁失败 %s", err)
+	uid := userFriend.UID
+	friendUid := userFriend.FriendUID
+	uids := utils.Int64Slice{uid, friendUid}
+	sort.Sort(uids)
+	key := fmt.Sprintf(enum.UserAndFriendLock, uids[0], uids[1])
+	mutex, err := utils.GetLock(key)
+	if err != nil {
+		return err
 	}
-	defer func(mutex *redsync.Mutex) {
-		_, err := mutex.Unlock()
-		if err != nil {
-			global.Logger.Errorf("解锁失败 %s", err)
-		}
-	}(mutex)
+	defer utils.ReleaseLock(mutex)
 
 	q := global.Query
 	tx := q.Begin()
@@ -98,7 +97,7 @@ func friendNew(userFriend model.UserFriend) error {
 	}
 
 	// 排序，uid小的在前
-	uids := utils.Int64Slice{userFriend.UID, userFriend.FriendUID}
+	uids = utils.Int64Slice{userFriend.UID, userFriend.FriendUID}
 	sort.Sort(uids)
 
 	//检查是否有软删除状态的记录
@@ -107,8 +106,8 @@ func friendNew(userFriend model.UserFriend) error {
 		return roomFriendQ.Where(roomFriend.Uid1.Eq(uids[0]), roomFriend.Uid2.Eq(uids[1]), roomFriend.DeleteStatus.Eq(pkgEnum.DELETED)).First()
 	}
 	roomFriedR := model.RoomFriend{}
-	key := fmt.Sprintf(enum.RoomFriendCacheByUidAndFriendUid, uids[0], uids[1])
-	err := utils.GetData(key, &roomFriedR, fun)
+	key = fmt.Sprintf(enum.RoomFriendCacheByUidAndFriendUid, uids[0], uids[1])
+	err = utils.GetData(key, &roomFriedR, fun)
 	// err
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		global.Logger.Errorf("查询数据失败: %v", err)
