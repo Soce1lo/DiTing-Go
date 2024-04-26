@@ -6,7 +6,7 @@ mysql:
 jwt:
   secret: diting
 log:
-  log_file_path: ./logs
+  log_file_path: ./log
   log_file_name: diting.log
 minio:
   accessKey: xxx
