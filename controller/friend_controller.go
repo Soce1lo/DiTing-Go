@@ -2,8 +2,8 @@ package controller
 
 import (
 	"DiTing-Go/domain/vo/req"
-	cursorUtils "DiTing-Go/pkg/cursor"
-	"DiTing-Go/pkg/resp"
+	pkgReq "DiTing-Go/pkg/domain/vo/req"
+	"DiTing-Go/pkg/domain/vo/resp"
 	"DiTing-Go/service"
 	"github.com/gin-gonic/gin"
 )
@@ -46,7 +46,7 @@ func ApplyFriendController(c *gin.Context) {
 func DeleteFriendController(c *gin.Context) {
 	uid := c.GetInt64("uid")
 	deleteFriendReq := req.DeleteFriendReq{}
-	if err := c.ShouldBindUri(&deleteFriendReq); err != nil {
+	if err := c.ShouldBind(&deleteFriendReq); err != nil {
 		resp.ErrorResponse(c, "参数错误")
 		return
 	}
@@ -94,7 +94,7 @@ func AgreeFriendController(c *gin.Context) {
 //	@Router		/api/user/getApplyList [get]
 func GetUserApplyController(c *gin.Context) {
 	uid := c.GetInt64("uid")
-	pageRequest := cursorUtils.PageReq{}
+	pageRequest := pkgReq.PageReq{}
 	if err := c.ShouldBindQuery(&pageRequest); err != nil { //ShouldBind()会自动推导
 		resp.ErrorResponse(c, "参数错误")
 		return
@@ -143,6 +143,39 @@ func UnreadApplyNumController(c *gin.Context) {
 	uid := c.GetInt64("uid")
 
 	response, err := service.UnreadApplyNumService(uid)
+	if err != nil {
+		c.Abort()
+		resp.ReturnErrorResponse(c, response)
+		return
+	}
+	resp.ReturnSuccessResponse(c, response)
+}
+
+func GetFriendListController(c *gin.Context) {
+	uid := c.GetInt64("uid")
+	pageRequest := pkgReq.PageReq{}
+	if err := c.ShouldBindQuery(&pageRequest); err != nil { //ShouldBind()会自动推导
+		resp.ErrorResponse(c, "参数错误")
+		return
+	}
+	response, err := service.GetFriendListService(uid, pageRequest)
+	if err != nil {
+		c.Abort()
+		resp.ReturnErrorResponse(c, response)
+		return
+	}
+	resp.ReturnSuccessResponse(c, response)
+}
+
+// GetUserInfoByNameController 根据好友昵称搜索好友
+func GetUserInfoByNameController(c *gin.Context) {
+	uid := c.GetInt64("uid")
+	getUserInfoByNameReq := req.GetUserInfoByNameReq{}
+	if err := c.ShouldBindQuery(&getUserInfoByNameReq); err != nil { //ShouldBind()会自动推导
+		resp.ErrorResponse(c, "参数错误")
+		return
+	}
+	response, err := service.GetUserInfoByNameService(uid, getUserInfoByNameReq.Name)
 	if err != nil {
 		c.Abort()
 		resp.ReturnErrorResponse(c, response)

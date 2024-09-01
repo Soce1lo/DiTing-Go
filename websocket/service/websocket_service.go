@@ -1,7 +1,7 @@
 package service
 
 import (
-	"DiTing-Go/domain/enum"
+	global2 "DiTing-Go/global"
 	"DiTing-Go/pkg/utils"
 	"DiTing-Go/websocket/global"
 	"fmt"
@@ -36,11 +36,15 @@ var upgrader = &websocket.Upgrader{
 // Connect 建立WebSocket连接
 func Connect(w http.ResponseWriter, r *http.Request) {
 	//先获得Http的token中的uid
-	uid, err := parseJwt(r)
+	//url中的获取token参数
+	params := r.URL.Query()
+	token := params.Get("token")
+	tokenInfo, err := utils.ParseToken(token)
 	if err != nil {
-		log.Print("Error during connection upgradation:", err)
+		global2.Logger.Errorf("无权限访问: %v", err)
 		return
 	}
+	uid := &tokenInfo.Uid
 	// Upgrade our raw HTTP connection to a websocket based one
 	conn, err := upgrader.Upgrade(w, r, nil)
 	// 关闭连接
@@ -82,21 +86,22 @@ func Connect(w http.ResponseWriter, r *http.Request) {
 }
 
 // Send 发送空消息代表有新消息，前端收到消息后再去后端拉取消息
-func Send(uid int64) {
+func Send(uid int64, value []byte) error {
 	stringUid := strconv.FormatInt(uid, 10)
 	channels, _ := global.UserChannelMap.Get(stringUid)
 	// 用户不在线，直接返回
 	if channels == nil {
-		return
+		return nil
 	}
 	for _, conn := range channels.ChannelList {
 		// 发送空消息，代表有新消息
-		err := conn.WriteMessage(enum.NewMessage, []byte("111"))
+		err := conn.WriteMessage(websocket.TextMessage, value)
 		if err != nil {
-			fmt.Println("写入错误")
-			break
+			global2.Logger.Errorf("发送消息失败: %v", err)
+			return errors.New("Business Error")
 		}
 	}
+	return nil
 }
 
 // 移除连接

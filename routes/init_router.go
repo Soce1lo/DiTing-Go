@@ -3,8 +3,8 @@ package routes
 import (
 	"DiTing-Go/controller"
 	_ "DiTing-Go/docs"
+	"DiTing-Go/pkg/domain/vo/resp"
 	"DiTing-Go/pkg/middleware"
-	"DiTing-Go/pkg/resp"
 	"DiTing-Go/service"
 	"DiTing-Go/websocket/global"
 	websocketService "DiTing-Go/websocket/service"
@@ -23,14 +23,15 @@ func InitRouter() {
 
 // 初始化websocket
 func initWebSocket() {
-	http.HandleFunc("/socket", websocketService.Connect)
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+	http.HandleFunc("/websocket", websocketService.Connect)
+	log.Fatal(http.ListenAndServe("localhost:5001", nil))
 }
 
 // 初始化gin
 func initGin() {
 	router := gin.Default()
 	router.Use(middleware.LoggerToFile())
+	router.Use(middleware.Cors())
 	//添加swagger访问路由
 	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 	// 不需要身份验证的路由
@@ -48,17 +49,19 @@ func initGin() {
 		//添加好友
 		apiUser.POST("/add", controller.ApplyFriendController)
 		//删除好友
-		apiUser.DELETE("/delete/:uid", controller.DeleteFriendController)
+		apiUser.DELETE("/delete/", controller.DeleteFriendController)
 		//同意好友申请
 		apiUser.PUT("/agree", controller.AgreeFriendController)
 		//获取好友申请列表
 		apiUser.GET("/getApplyList", controller.GetUserApplyController)
 		//获取好友列表
-		apiUser.GET("/getFriendList", service.GetFriendList)
+		apiUser.GET("/getFriendList", controller.GetFriendListController)
 		// 判断是否是好友
 		apiUser.GET("/isFriend/:friendUid", controller.IsFriendController)
 		//好友申请未读数量
 		apiUser.GET("/unreadApplyNum", controller.UnreadApplyNumController)
+		//根据好友昵称搜索好友
+		apiUser.GET("/getUserInfoByName", controller.GetUserInfoByNameController)
 		// TODO:测试使用
 		apiUser.GET("/test", test)
 	}
@@ -66,7 +69,7 @@ func initGin() {
 	apiGroup.Use(middleware.JWT())
 	{
 		//创建群聊
-		apiGroup.POST("/create", service.CreateGroupService)
+		apiGroup.POST("/create", controller.CreateGroupController)
 		apiGroup.DELETE("/:id", service.DeleteGroupService)
 		apiGroup.POST("/join", service.JoinGroupService)
 		apiGroup.POST("/quit", service.QuitGroupService)
@@ -78,14 +81,17 @@ func initGin() {
 	apiContact := router.Group("/api/contact")
 	apiContact.Use(middleware.JWT())
 	{
-		apiContact.GET("getContactList", service.GetContactListService)
-		apiContact.GET("getContactDetail", service.GetContactDetailService)
+		apiContact.GET("getContactList", controller.GetContactListController)
+		apiContact.GET("getNewContactList", controller.GetNewContactListController)
+		apiContact.GET("getMessageList", service.GetContactDetailService)
+		apiContact.GET("getNewMsgList", controller.GetNewMsgListController)
+		apiContact.POST("userInfo/batch", controller.GetUserInfoBatchController)
 	}
 
-	apiMsg := router.Group("/api/msg")
+	apiMsg := router.Group("/api/chat")
 	apiMsg.Use(middleware.JWT())
 	{
-		apiMsg.POST("textMsg", service.SendTextMsgService)
+		apiMsg.POST("msg", controller.SendMessageController)
 	}
 
 	apiFile := router.Group("/api/file")
@@ -103,7 +109,7 @@ func initGin() {
 // TODO:测试使用
 func test(c *gin.Context) {
 	msg := new(global.Msg)
-	msg.Uid = 20017
-	websocketService.Send(msg.Uid)
+	msg.Uid = 2
+	websocketService.Send(msg.Uid, []byte("{\"type\":4}"))
 	resp.SuccessResponse(c, nil)
 }

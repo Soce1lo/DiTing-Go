@@ -6,34 +6,20 @@ import (
 	"DiTing-Go/domain/enum"
 	"DiTing-Go/domain/vo/req"
 	"DiTing-Go/global"
-	"DiTing-Go/pkg/cursor"
-	"DiTing-Go/pkg/resp"
+	pkgEnum "DiTing-Go/pkg/domain/enum"
+	"DiTing-Go/pkg/domain/vo/resp"
+	pkgResp "DiTing-Go/pkg/domain/vo/resp"
 	"context"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 	"gorm.io/gorm"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// CreateGroupService 创建群聊
-//
-//	@Summary	创建群聊
-//	@Produce	json
-//	@Param		name	body		string					true	"群聊名称"
-//	@Success	200	{object}	resp.ResponseData	"成功"
-//	@Failure	500	{object}	resp.ResponseData	"内部错误"
-//	@Router		/api/group/create [post]
-func CreateGroupService(c *gin.Context) {
-	uid := c.GetInt64("uid")
-	creatGroupReq := req.CreateGroupReq{}
-	if err := c.ShouldBind(&creatGroupReq); err != nil { //ShouldBind()会自动推导
-		resp.ErrorResponse(c, "参数错误")
-		global.Logger.Errorf("参数错误: %v", err)
-		c.Abort()
-		return
-	}
+func CreateGroupService(uid int64, uidList []int64) (pkgResp.ResponseData, error) {
 
 	tx := global.Query.Begin()
 	ctx := context.Background()
@@ -46,12 +32,9 @@ func CreateGroupService(c *gin.Context) {
 	if err := roomTx.Create(&newRoom); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("添加房间表失败 %s", err.Error())
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 
 	// 查询用户头像
@@ -61,19 +44,29 @@ func CreateGroupService(c *gin.Context) {
 	if err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("查询用户表失败 %s", err.Error())
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
+
+	uidList = append([]int64{uid}, uidList...)
+	userRList, err := userTx.Where(user.ID.In(uidList...)).Find()
+	groupName := ""
+	for _, user := range userRList {
+		groupName += (user.Name + "、")
+	}
+	groupName = strings.TrimRight(groupName, "、")
+	runes := []rune(groupName)
+	if len(runes) > 10 {
+		runes = runes[:10]
+	}
+	groupName = string(runes) + "..."
 
 	// 创建群聊表
 	roomGroupTx := tx.RoomGroup.WithContext(ctx)
 	newRoomGroup := model.RoomGroup{
 		RoomID: newRoom.ID,
-		Name:   creatGroupReq.Name,
+		Name:   groupName,
 		// 默认为创建者头像
 		Avatar:  userR.Avatar,
 		ExtJSON: "{}",
@@ -81,50 +74,51 @@ func CreateGroupService(c *gin.Context) {
 	if err := roomGroupTx.Create(&newRoomGroup); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("添加群聊表失败 %s", err.Error())
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 
 	groupMemberTx := tx.GroupMember.WithContext(ctx)
-	newGroupMember := model.GroupMember{
-		UID:     uid,
-		GroupID: newRoomGroup.ID,
-		// TODO: 1为群主,抽取为常量
-		Role: 1,
+	newGroupMemberList := []*model.GroupMember{
+		{
+			UID:     uid,
+			GroupID: newRoomGroup.ID,
+			// TODO: 1为群主,抽取为常量
+			Role: 1,
+		},
 	}
-	if err := groupMemberTx.Create(&newGroupMember); err != nil {
+	for _, userInfo := range userRList {
+		newGroupMemberList = append(newGroupMemberList, &model.GroupMember{
+			UID:     userInfo.ID,
+			GroupID: newRoomGroup.ID,
+			// TODO: 1为群主,抽取为常量
+			Role: 2,
+		})
+	}
+	if err := groupMemberTx.Create(newGroupMemberList...); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("添加群组成员表失败 %s", err.Error())
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 	// 自动发送一条消息
 	messageTx := tx.Message.WithContext(ctx)
 	newMessage := model.Message{
-		FromUID: uid,
-		RoomID:  newRoom.ID,
-		Type:    enum.TextMessageType,
-		Content: "欢迎加入群聊",
-		Extra:   "{}",
+		FromUID:      uid,
+		RoomID:       newRoom.ID,
+		Type:         enum.TextMessageType,
+		Content:      "欢迎加入群聊",
+		Extra:        "{}",
+		DeleteStatus: pkgEnum.NORMAL,
 	}
 	if err := messageTx.Create(&newMessage); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("添加消息表失败 %s", err.Error())
-		return
-
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 
 	// 创建会话表
@@ -139,25 +133,19 @@ func CreateGroupService(c *gin.Context) {
 	if err := contactTx.Create(&newContact); err != nil {
 		if err := tx.Rollback(); err != nil {
 			global.Logger.Errorf("事务回滚失败 %s", err.Error())
-			return
 		}
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
 		global.Logger.Errorf("添加会话表失败 %s", err.Error())
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 
 	if err := tx.Commit(); err != nil {
 		global.Logger.Errorf("事务提交失败 %s", err.Error())
-		resp.ErrorResponse(c, "创建群聊失败")
-		c.Abort()
-		return
+		return pkgResp.ErrorResponseData("系统繁忙，请稍后再试~"), errors.New("Business Error")
 	}
 
 	global.Bus.Publish(enum.NewMessageEvent, newMessage)
 
-	resp.SuccessResponseWithMsg(c, "success")
-	return
+	return pkgResp.SuccessResponseData("success"), nil
 }
 
 // DeleteGroupService 删除群聊
@@ -430,7 +418,6 @@ func JoinGroupService(c *gin.Context) {
 	global.Bus.Publish(enum.NewMessageEvent, newMessage)
 
 	resp.SuccessResponseWithMsg(c, "success")
-	return
 }
 
 // QuitGroupService 退出群聊
@@ -539,7 +526,7 @@ func GetGroupMemberListService(c *gin.Context) {
 	// 查询房间表
 	room := global.Query.Room
 	roomQ := room.WithContext(ctx)
-	roomR, err := roomQ.Where(room.ID.Eq(getGroupMemberListReq.ID)).First()
+	roomR, err := roomQ.Where(room.ID.Eq(getGroupMemberListReq.RoomId)).First()
 	if err != nil {
 		resp.ErrorResponse(c, "查询群聊失败")
 		global.Logger.Errorf("查询房间失败 %s", err)
@@ -576,7 +563,7 @@ func GetGroupMemberListService(c *gin.Context) {
 	// 查询群组成员表,联表游标翻页
 	user := global.Query.User
 	userQ := user.WithContext(ctx)
-	if err := userQ.Select(user.Name, user.Avatar, user.ActiveStatus, user.LastOptTime).LeftJoin(groupMemberQ, user.ID.EqCol(groupMember.UID)).Where(groupMember.GroupID.Eq(roomGroupR.ID), user.ActiveStatus.Eq(int32(status)), user.LastOptTime.Gt(activeTime)).Limit(getGroupMemberListReq.PageSize).Scan(&userR); err != nil {
+	if err := userQ.Select(user.ID, user.Name, user.Avatar, user.ActiveStatus, user.LastOptTime).LeftJoin(groupMemberQ, user.ID.EqCol(groupMember.UID)).Where(groupMember.GroupID.Eq(roomGroupR.ID), user.ActiveStatus.Eq(int32(status)), user.LastOptTime.Gt(activeTime)).Limit(getGroupMemberListReq.PageSize).Scan(&userR); err != nil {
 		resp.ErrorResponse(c, "查询群聊失败")
 		global.Logger.Errorf("查询群组成员表失败 %s", err)
 		c.Abort()
@@ -585,7 +572,7 @@ func GetGroupMemberListService(c *gin.Context) {
 	// 不足，用不在线的补充
 	if len(userR) < getGroupMemberListReq.PageSize && status == 1 {
 		var add []dto.GetGroupMemberDto
-		if err := userQ.Select(user.Name, user.Avatar, user.ActiveStatus, user.LastOptTime).LeftJoin(groupMemberQ, user.ID.EqCol(groupMember.UID)).Where(groupMember.GroupID.Eq(roomGroupR.ID), user.ActiveStatus.Eq(2)).Limit(getGroupMemberListReq.PageSize - len(userR)).Scan(&add); err != nil {
+		if err := userQ.Select(user.ID, user.Name, user.Avatar, user.ActiveStatus, user.LastOptTime).LeftJoin(groupMemberQ, user.ID.EqCol(groupMember.UID)).Where(groupMember.GroupID.Eq(roomGroupR.ID), user.ActiveStatus.Eq(2)).Limit(getGroupMemberListReq.PageSize - len(userR)).Scan(&add); err != nil {
 			resp.ErrorResponse(c, "查询群聊失败")
 			global.Logger.Errorf("查询群组成员表失败 %s", err)
 			c.Abort()
@@ -595,7 +582,7 @@ func GetGroupMemberListService(c *gin.Context) {
 	}
 
 	newCursor := genCursor(userR)
-	resp.SuccessResponse(c, cursor.PageResp{
+	resp.SuccessResponse(c, pkgResp.PageResp{
 		Cursor: &newCursor,
 		IsLast: len(userR) < getGroupMemberListReq.PageSize,
 		Data:   userR,
@@ -773,6 +760,6 @@ func genCursor(users []dto.GetGroupMemberDto) string {
 	}
 	status := users[len(users)-1].ActiveStatus
 	activeTime := users[len(users)-1].LastOptTime
-	newCursor := fmt.Sprintf("%d_%d", status, activeTime.Unix())
+	newCursor := fmt.Sprintf("%d_%d", status, activeTime.UnixMilli())
 	return newCursor
 }
